@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ロードノイズ低減 サンプル</title>
+<style>
+  :root { --bg:#10141a; --card:#1a212b; --fg:#e8edf3; --sub:#8b98a8; --ac:#4cc2ff; --ok:#3ddc84; --ng:#ff5c5c; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:-apple-system,"Hiragino Sans",sans-serif;
+         padding:max(14px,env(safe-area-inset-top)) 14px max(20px,env(safe-area-inset-bottom)); max-width:520px; margin-inline:auto; }
+  h1 { font-size:18px; margin:4px 0 10px; }
+  .warn { background:#3a2a10; border:1px solid #7a5a1a; color:#ffd58a; border-radius:10px; padding:10px 12px; font-size:13px; line-height:1.5; margin-bottom:12px; }
+  .card { background:var(--card); border-radius:14px; padding:14px; margin-bottom:12px; }
+  button { font:inherit; border:0; border-radius:12px; padding:14px; width:100%; font-weight:700; font-size:17px; color:#06121c; background:var(--ac); }
+  button.off { background:#3a4656; color:var(--fg); }
+  button.stop { background:var(--ng); color:#fff; }
+  button:disabled { opacity:.4; }
+  .row { display:flex; align-items:center; gap:10px; margin:12px 0 4px; font-size:14px; }
+  .row label { flex:0 0 96px; color:var(--sub); }
+  .row output { flex:0 0 64px; text-align:right; font-variant-numeric:tabular-nums; }
+  input[type=range] { flex:1; accent-color:var(--ac); }
+  .meter { height:18px; background:#0b0f14; border-radius:9px; overflow:hidden; margin:8px 0; }
+  .meter > div { height:100%; width:0; background:linear-gradient(90deg,var(--ok),var(--ac)); transition:width .08s; }
+  .big { font-size:34px; font-weight:800; font-variant-numeric:tabular-nums; }
+  .sub { color:var(--sub); font-size:12px; line-height:1.5; }
+  canvas { width:100%; height:90px; background:#0b0f14; border-radius:10px; display:block; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  #msg { font-size:13px; min-height:1.4em; margin-top:8px; color:var(--sub); }
+</style>
+</head>
+<body>
+<h1>ロードノイズ低減 サンプル</h1>
+<div class="warn">
+  ⚠ 設定は<b>停車中</b>に行ってください。走行中は画面を操作しないでください。<br>
+  低い音だけを打ち消す試作です。クラクションや周囲の声は消えませんが、音量は小さめから始め、違和感があればすぐ「停止」してください。
+</div>
+
+<div class="card">
+  <button id="start">開始（マイクを使う）</button>
+  <div id="msg">Safariでマイクの許可が出たら「許可」を押してください。画面は点けたままにします。</div>
+</div>
+
+<div class="card">
+  <div class="sub">マイクで拾った低音域（50〜300Hz）の大きさ</div>
+  <div class="big"><span id="lv">--</span> <span style="font-size:16px">dB</span></div>
+  <div class="meter"><div id="bar"></div></div>
+  <canvas id="spec" width="480" height="180"></canvas>
+  <div class="grid" style="margin-top:10px">
+    <button id="base" class="off" disabled>基準を記録（OFF状態）</button>
+    <button id="auto" disabled>自動調整</button>
+  </div>
+  <div style="margin-top:10px">差：<b id="diff">--</b> <span class="sub">（マイナスなら低音が減っています）</span></div>
+</div>
+
+<div class="card">
+  <div class="row"><label>打ち消し量</label><input id="amt" type="range" min="0" max="100" value="0"><output id="amtO">0%</output></div>
+  <div class="row"><label>遅延補正</label><input id="dly" type="range" min="0" max="40" step="0.5" value="0"><output id="dlyO">0 ms</output></div>
+  <div class="row"><label>上限周波数</label><input id="cut" type="range" min="100" max="400" step="10" value="250"><output id="cutO">250 Hz</output></div>
+  <button id="toggle" class="off" style="margin-top:12px" disabled>低減 OFF</button>
+  <button id="stop" class="stop" style="margin-top:10px" disabled>停止</button>
+</div>
+
+<div class="card sub">
+  使い方：①開始 → ②低減OFFのまま「基準を記録」 → ③低減ONにして「自動調整」 → ④差がマイナスになる位置を確認。<br>
+  スマホは頭に近い位置（ヘッドレスト付近など）に固定してください。接続は有線を推奨します。
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let ctx, stream, src, hp, lp, delay, inv, comp, analyser, wake;
+  let running = false, enabled = false, baseline = null, tuning = false;
+
+  const LOW = 50, HIGH = 300;
+
+  function amtGain() { return -($("amt").value / 100) * 0.9; } // 逆位相（負のゲイン）
+
+  function applyParams() {
+    if (!ctx) return;
+    const t = ctx.currentTime;
+    inv.gain.setTargetAtTime(enabled ? amtGain() : 0, t, 0.05);
+    delay.delayTime.setTargetAtTime($("dly").value / 1000, t, 0.02);
+    lp.frequency.setTargetAtTime(+$("cut").value, t, 0.02);
+    $("amtO").textContent = $("amt").value + "%";
+    $("dlyO").textContent = $("dly").value + " ms";
+    $("cutO").textContent = $("cut").value + " Hz";
+  }
+  ["amt","dly","cut"].forEach(id => $(id).addEventListener("input", applyParams));
+
+  async function start() {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false, channelCount:1 }
+      });
+    } catch (e) {
+      $("msg").textContent = "マイクを使えません：" + e.message + "（HTTPSで開き、Safariの許可を確認してください）";
+      return;
+    }
+    ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+    await ctx.resume();
+    src = ctx.createMediaStreamSource(stream);
+    hp = ctx.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = 40;
+    lp = ctx.createBiquadFilter(); lp.type = "lowpass"; lp.Q.value = 0.7;
+    delay = ctx.createDelay(0.1);
+    inv = ctx.createGain(); inv.gain.value = 0;
+    comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -24; comp.ratio.value = 12; comp.attack.value = 0.003; comp.release.value = 0.1;
+    analyser = ctx.createAnalyser(); analyser.fftSize = 2048; analyser.smoothingTimeConstant = 0;
+    src.connect(analyser);
+    src.connect(hp); hp.connect(lp); lp.connect(delay); delay.connect(inv); inv.connect(comp); comp.connect(ctx.destination);
+    applyParams();
+    running = true;
+    try { wake = await navigator.wakeLock.request("screen"); } catch (_) {}
+    $("start").disabled = true; $("stop").disabled = false; $("toggle").disabled = false;
+    $("base").disabled = false; $("auto").disabled = false;
+    $("msg").textContent = "動作中。遅延の目安：出力遅延 " + Math.round((ctx.outputLatency || ctx.baseLatency || 0) * 1000) + " ms";
+    loop();
+  }
+
+  function stop() {
+    running = false; enabled = false; tuning = false;
+    try { stream.getTracks().forEach(t => t.stop()); } catch (_) {}
+    try { ctx.close(); } catch (_) {}
+    try { wake && wake.release(); } catch (_) {}
+    $("start").disabled = false; $("stop").disabled = true; $("toggle").disabled = true;
+    $("base").disabled = true; $("auto").disabled = true;
+    $("toggle").textContent = "低減 OFF"; $("toggle").classList.add("off");
+    $("msg").textContent = "停止しました。";
+  }
+
+  // 低音域の平均パワー(dB)
+  const buf = new Float32Array(1024);
+  function bandDb() {
+    analyser.getFloatFrequencyData(buf);
+    const bw = ctx.sampleRate / analyser.fftSize;
+    let sum = 0, n = 0;
+    for (let i = Math.floor(LOW / bw); i <= Math.ceil(HIGH / bw); i++) { sum += Math.pow(10, buf[i] / 10); n++; }
+    return 10 * Math.log10(sum / n + 1e-12);
+  }
+
+  let smooth = null;
+  function loop() {
+    if (!running) return;
+    const db = bandDb();
+    smooth = smooth === null ? db : smooth * 0.85 + db * 0.15;
+    $("lv").textContent = smooth.toFixed(1);
+    $("bar").style.width = Math.max(0, Math.min(100, (smooth + 100) * 1.6)) + "%";
+    if (baseline !== null) {
+      const d = smooth - baseline;
+      $("diff").textContent = (d > 0 ? "+" : "") + d.toFixed(1) + " dB";
+      $("diff").style.color = d < -0.5 ? "var(--ok)" : d > 0.5 ? "var(--ng)" : "var(--fg)";
+    }
+    drawSpec();
+    requestAnimationFrame(loop);
+  }
+
+  function drawSpec() {
+    const c = $("spec"), g = c.getContext("2d");
+    g.clearRect(0, 0, c.width, c.height);
+    const bw = ctx.sampleRate / analyser.fftSize, maxHz = 600, N = Math.floor(maxHz / bw);
+    for (let i = 0; i < N; i++) {
+      const h = Math.max(0, (buf[i] + 110) / 80) * c.height;
+      const hz = i * bw;
+      g.fillStyle = hz >= LOW && hz <= HIGH ? "#4cc2ff" : "#2c3846";
+      g.fillRect(i * (c.width / N), c.height - h, c.width / N - 1, h);
+    }
+  }
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  async function measure(ms) {
+    const t0 = performance.now(); let s = 0, n = 0;
+    while (performance.now() - t0 < ms) { s += Math.pow(10, bandDb() / 10); n++; await sleep(40); }
+    return 10 * Math.log10(s / n + 1e-12);
+  }
+
+  async function autoTune() {
+    if (tuning) return;
+    tuning = true; $("auto").disabled = true;
+    const amtKeep = $("amt").value;
+    if (+$("amt").value < 30) $("amt").value = 30;
+    enabled = true; setToggleUi();
+    let best = { d: 0, lvl: Infinity };
+    for (let d = 0; d <= 30 && running; d += 2) {
+      $("dly").value = d; applyParams();
+      $("msg").textContent = "自動調整中… 遅延 " + d + " ms";
+      await sleep(350);
+      const lvl = await measure(450);
+      if (lvl < best.lvl) best = { d, lvl };
+    }
+    if (!running) return;
+    $("dly").value = best.d; applyParams();
+    await sleep(350);
+    const final = await measure(500);
+    if (baseline !== null && final >= baseline - 0.3) {
+      enabled = false; $("amt").value = amtKeep; setToggleUi(); applyParams();
+      $("msg").textContent = "この条件では低音が減りませんでした（OFFに戻しました）。マイク位置や上限周波数を変えて再度お試しください。";
+    } else {
+      $("msg").textContent = "調整完了：遅延 " + best.d + " ms";
+    }
+    tuning = false; $("auto").disabled = false;
+  }
+
+  function setToggleUi() {
+    $("toggle").textContent = enabled ? "低減 ON" : "低減 OFF";
+    $("toggle").classList.toggle("off", !enabled);
+  }
+
+  $("start").onclick = start;
+  $("stop").onclick = stop;
+  $("toggle").onclick = () => { enabled = !enabled; setToggleUi(); applyParams(); };
+  $("base").onclick = async () => {
+    const was = enabled; enabled = false; setToggleUi(); applyParams();
+    $("msg").textContent = "基準を測定中…（静かにお待ちください）";
+    await sleep(500);
+    baseline = await measure(1500);
+    enabled = was; setToggleUi(); applyParams();
+    $("msg").textContent = "基準を記録しました：" + baseline.toFixed(1) + " dB";
+  };
+  $("auto").onclick = () => {
+    if (baseline === null) { $("msg").textContent = "先に「基準を記録」を押してください。"; return; }
+    autoTune();
+  };
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && running) { stop(); $("msg").textContent = "画面を離れたため停止しました。"; }
+  });
+})();
+</script>
+</body>
+</html>
